@@ -1,0 +1,452 @@
+          <button class="btn ghost small" data-paste="offer-in">Paste</button>
+          <button class="btn small" id="btn-gen-answer">Create reply</button>
+        </div>
+      </div>
+      <div class="step">
+        <label><span class="num">2</span>Send this reply code back to the host</label>
+        <textarea id="answer-out" readonly placeholder="Your reply code appears here…"></textarea>
+        <div class="row">
+          <button class="btn ghost small" data-copy="answer-out">Copy</button>
+          <button class="btn ghost small share-btn" data-share="answer-out">Share…</button>
+        </div>
+        <p class="hint">Once the host taps Connect, this screen switches to the walkie-talkie automatically.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Walkie-talkie -->
+  <section class="card ptt-card hidden" id="ptt-card">
+    <div class="bar">
+      <div>
+        <div class="t1" id="chan-title">Standby</div>
+        <div class="t2" id="remote-state">Peer: listening</div>
+      </div>
+      <div class="meter" id="meter"><i></i><i></i><i></i><i></i><i></i></div>
+    </div>
+
+    <div class="ptt-wrap">
+      <div class="halo"></div>
+      <button id="ptt-btn" aria-label="Push to talk">
+        <div class="in">
+          <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
+          <span id="ptt-label">Hold to talk</span>
+        </div>
+      </button>
+    </div>
+
+    <div class="opts">
+      <div class="opt"><span>Tap to start / tap to stop</span>
+        <label class="switch"><input type="checkbox" id="toggle-mode"><span></span></label></div>
+      <div class="opt"><span>Speaker volume</span>
+        <input type="range" id="vol" min="0" max="1" step="0.05" value="1"></div>
+    </div>
+    <button class="btn ghost" id="btn-reset">Disconnect / new connection</button>
+    <p class="hint">Keep the screen on and this tab in the foreground. Phones pause the mic when locked. Spacebar also works on desktop.</p>
+  </section>
+</main>
+
+<audio id="remote-audio" autoplay playsinline></audio>
+<div id="toast"></div>
+<footer>WebRTC peer-to-peer &bull; runs entirely in your browser</footer>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+
+  // LAN only: no STUN/TURN needed, host candidates are enough.
+  const RTC_CONFIG = { iceServers: [] };
+
+  let pc = null, dc = null, localStream = null, remoteStream = null;
+  let role = 'host', transmitting = false, wakeLock = null;
+  let audioCtx = null, localAn = null, remoteAn = null, meterOn = false;
+  const remoteAudio = $('remote-audio');
+
+  /* ---------- helpers ---------- */
+  let toastT;
+  function toast(msg, type = 'success') {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = 'show ' + type;
+    clearTimeout(toastT);
+    toastT = setTimeout(() => t.classList.remove('show'), 3200);
+  }
+  function setStatus(kind, text) {
+    $('status').dataset.k = kind;
+    $('status-text').textContent = text;
+  }
+  const show = (id, on = true) => $(id).classList.toggle('hidden', !on);
+
+  /* ---------- signalling codes (compact, copy/paste friendly) ---------- */
+  function bytesToB64(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function b64ToBytes(str) {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) str += '=';
+    const bin = atob(str), out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function pipe(bytes, stream) {
+    const w = stream.writable.getWriter();
+    w.write(bytes); w.close();
+    return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  }
+  async function encodeDesc(desc) {
+    const raw = new TextEncoder().encode(JSON.stringify({ t: desc.type, s: desc.sdp }));
+    if (typeof CompressionStream !== 'undefined') {
+      return 'WT1:' + bytesToB64(await pipe(raw, new CompressionStream('deflate-raw')));
+    }
+    return 'WT0:' + bytesToB64(raw);
+  }
+  async function decodeDesc(text) {
+    text = (text || '').replace(/\s+/g, '');
+    if (!text) throw new Error('empty');
+    let json;
+    if (text.startsWith('WT1:')) {
+      if (typeof DecompressionStream === 'undefined') throw new Error('This browser cannot read compressed codes. Update it.');
+      json = new TextDecoder().decode(await pipe(b64ToBytes(text.slice(4)), new DecompressionStream('deflate-raw')));
+    } else if (text.startsWith('WT0:')) {
+      json = new TextDecoder().decode(b64ToBytes(text.slice(4)));
+    } else {
+      json = text; // legacy raw JSON
+    }
+    const o = JSON.parse(json);
+    return { type: o.t || o.type, sdp: o.s || o.sdp };
+  }
+
+  /* ---------- microphone ---------- */
+  async function startMic() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      show('secure-warn');
+      toast('Microphone API unavailable. Page must be HTTPS or localhost.', 'error');
+      return;
+    }
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+      });
+    } catch (err) {
+      console.error(err);
+      toast('Microphone permission denied or unavailable.', 'error');
+      return;
+    }
+    localStream.getAudioTracks().forEach(t => (t.enabled = false)); // muted until PTT
+
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      localAn = audioCtx.createAnalyser();
+      localAn.fftSize = 256;
+      audioCtx.createMediaStreamSource(localStream).connect(localAn); // not routed to speakers
+    } catch (e) { console.warn('Analyser unavailable', e); }
+
+    requestWakeLock();
+    show('mic-card', false);
+    show('setup', true);
+    toast('Microphone ready.');
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => (wakeLock = null));
+      }
+    } catch (_) {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      if (localStream && !wakeLock) requestWakeLock();
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    } else if (transmitting && !$('toggle-mode').checked) {
+      stopSpeaking();
+    }
+  });
+
+  /* ---------- WebRTC ---------- */
+  function createPC() {
+    if (pc) { try { pc.close(); } catch (_) {} }
+    pc = new RTCPeerConnection(RTC_CONFIG);
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+    pc.ontrack = e => {
+      remoteStream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+      remoteAudio.srcObject = remoteStream;
+      remoteAudio.play().catch(() => {});
+      try {
+        if (audioCtx) {
+          remoteAn = audioCtx.createAnalyser();
+          remoteAn.fftSize = 256;
+          audioCtx.createMediaStreamSource(remoteStream).connect(remoteAn);
+        }
+      } catch (_) {}
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === 'connected') {
+        setStatus('ok', 'Connected');
+        showWalkie();
+      } else if (s === 'connecting') {
+        setStatus('warn', 'Connecting…');
+      } else if (s === 'disconnected') {
+        setStatus('bad', 'Connection lost…');
+      } else if (s === 'failed') {
+        toast('Connection failed. Check both phones are on the same Wi-Fi (no guest/AP-isolation), then retry.', 'error');
+        resetConnection();
+      } else if (s === 'closed') {
+        setStatus('bad', 'Not connected');
+      }
+    };
+
+    // Pre-negotiated data channel: identical on both sides, no role dependency.
+    dc = pc.createDataChannel('ptt', { negotiated: true, id: 0 });
+    dc.onmessage = e => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'tx') setRemoteTalking(!!m.on);
+      } catch (_) {}
+    };
+    dc.onopen = () => { if (transmitting) sendTx(true); };
+  }
+
+  function waitIce(timeoutMs = 4000) {
+    return new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      let t;
+      const done = () => { pc.removeEventListener('icegatheringstatechange', chk); clearTimeout(t); resolve(); };
+      const chk = () => { if (pc.iceGatheringState === 'complete') done(); };
+      pc.addEventListener('icegatheringstatechange', chk);
+      t = setTimeout(done, timeoutMs);
+    });
+  }
+
+  async function generateOffer() {
+    try {
+      $('btn-gen-offer').disabled = true;
+      createPC();
+      await pc.setLocalDescription(await pc.createOffer());
+      await waitIce();
+      $('offer-out').value = await encodeDesc(pc.localDescription);
+      setStatus('warn', 'Waiting for reply code');
+      toast('Code ready. Copy or share it to the other phone.');
+    } catch (err) {
+      console.error(err);
+      toast('Could not create the code.', 'error');
+    } finally {
+      $('btn-gen-offer').disabled = false;
+    }
+  }
+
+  async function acceptAnswer() {
+    if (!pc || !pc.localDescription) return toast('Generate your code first.', 'error');
+    try {
+      const d = await decodeDesc($('answer-in').value);
+      if (d.type !== 'answer') throw new Error('That is not a reply code (did you paste your own code?).');
+      await pc.setRemoteDescription(d);
+      setStatus('warn', 'Connecting…');
+    } catch (err) {
+      console.error(err);
+      toast(err.message && err.message.length < 90 ? err.message : 'Invalid reply code.', 'error');
+    }
+  }
+
+  async function generateAnswer() {
+    try {
+      const d = await decodeDesc($('offer-in').value);
+      if (d.type !== 'offer') throw new Error('That is not a host code (did you paste a reply code?).');
+      $('btn-gen-answer').disabled = true;
+      createPC();
+      await pc.setRemoteDescription(d);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await waitIce();
+      $('answer-out').value = await encodeDesc(pc.localDescription);
+      setStatus('warn', 'Send reply to host');
+      toast('Reply ready. Send it back to the host.');
+    } catch (err) {
+      console.error(err);
+      toast(err.message && err.message.length < 90 ? err.message : 'Invalid host code.', 'error');
+    } finally {
+      $('btn-gen-answer').disabled = false;
+    }
+  }
+
+  function showWalkie() {
+    show('setup', false);
+    show('ptt-card', true);
+    $('ptt-card').classList.remove('off');
+    remoteAudio.play().catch(() => {});
+    startMeter();
+  }
+
+  function resetConnection() {
+    stopSpeaking();
+    meterOn = false;
+    try { dc && dc.close(); } catch (_) {}
+    try { pc && pc.close(); } catch (_) {}
+    pc = dc = remoteStream = remoteAn = null;
+    remoteAudio.srcObject = null;
+    ['offer-out', 'answer-in', 'offer-in', 'answer-out'].forEach(id => ($(id).value = ''));
+    setRemoteTalking(false);
+    show('ptt-card', false);
+    if (localStream) show('setup', true);
+    setStatus('bad', 'Not connected');
+  }
+
+  /* ---------- push to talk ---------- */
+  function sendTx(on) {
+    if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ type: 'tx', on }));
+  }
+  function connected() { return pc && pc.connectionState === 'connected'; }
+
+  function startSpeaking() {
+    if (transmitting || !localStream || !connected()) return;
+    transmitting = true;
+    localStream.getAudioTracks().forEach(t => (t.enabled = true));
+    $('app').classList.add('tx');
+    $('ptt-label').textContent = $('toggle-mode').checked ? 'Tap to stop' : 'Talking…';
+    $('chan-title').textContent = 'Transmitting';
+    sendTx(true);
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+  function stopSpeaking() {
+    if (!transmitting) return;
+    transmitting = false;
+    if (localStream) localStream.getAudioTracks().forEach(t => (t.enabled = false));
+    $('app').classList.remove('tx');
+    $('ptt-label').textContent = $('toggle-mode').checked ? 'Tap to talk' : 'Hold to talk';
+    $('chan-title').textContent = 'Standby';
+    sendTx(false);
+  }
+  function setRemoteTalking(on) {
+    $('remote-state').textContent = on ? 'Peer is talking…' : 'Peer: listening';
+    $('remote-state').classList.toggle('talking', on);
+    $('app').classList.toggle('rx', on && !transmitting);
+  }
+
+  function unlockAudio() {
+    remoteAudio.play().catch(() => {});
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  }
+
+  const ptt = $('ptt-btn');
+  ptt.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    unlockAudio();
+    try { ptt.setPointerCapture(e.pointerId); } catch (_) {}
+    if ($('toggle-mode').checked) { transmitting ? stopSpeaking() : startSpeaking(); }
+    else startSpeaking();
+  });
+  const release = () => { if (!$('toggle-mode').checked) stopSpeaking(); };
+  ptt.addEventListener('pointerup', release);
+  ptt.addEventListener('pointercancel', release);
+  ptt.addEventListener('lostpointercapture', release);
+  ptt.addEventListener('contextmenu', e => e.preventDefault());
+  window.addEventListener('blur', release);
+
+  // Desktop spacebar
+  const typing = () => /^(TEXTAREA|INPUT)$/.test(document.activeElement && document.activeElement.tagName);
+  window.addEventListener('keydown', e => {
+    if (e.code !== 'Space' || e.repeat || typing() || $('ptt-card').classList.contains('hidden')) return;
+    e.preventDefault();
+    unlockAudio();
+    if ($('toggle-mode').checked) { transmitting ? stopSpeaking() : startSpeaking(); }
+    else startSpeaking();
+  });
+  window.addEventListener('keyup', e => {
+    if (e.code !== 'Space' || typing()) return;
+    if (!$('toggle-mode').checked) stopSpeaking();
+  });
+
+  $('toggle-mode').addEventListener('change', () => {
+    stopSpeaking();
+    $('ptt-label').textContent = $('toggle-mode').checked ? 'Tap to talk' : 'Hold to talk';
+  });
+  $('vol').addEventListener('input', e => (remoteAudio.volume = parseFloat(e.target.value)));
+
+  /* ---------- level meter (real audio levels) ---------- */
+  const lvBuf = new Uint8Array(256);
+  function level(an) {
+    if (!an) return 0;
+    an.getByteTimeDomainData(lvBuf);
+    let s = 0;
+    for (let i = 0; i < lvBuf.length; i++) { const v = (lvBuf[i] - 128) / 128; s += v * v; }
+    return Math.min(1, Math.sqrt(s / lvBuf.length) * 5);
+  }
+  function startMeter() {
+    if (meterOn) return;
+    meterOn = true;
+    const bars = Array.from($('meter').children);
+    const w = [0.6, 0.9, 1, 0.8, 0.55];
+    (function frame() {
+      if (!meterOn) return;
+      const lv = level(transmitting ? localAn : remoteAn);
+      bars.forEach((b, i) => {
+        const h = 4 + lv * 26 * w[i] * (0.7 + Math.random() * 0.3);
+        b.style.height = h.toFixed(1) + 'px';
+        b.style.background = lv > 0.04 ? (transmitting ? '#818cf8' : '#10b981') : '';
+      });
+      requestAnimationFrame(frame);
+    })();
+  }
+
+  /* ---------- clipboard / share ---------- */
+  async function copyFrom(id) {
+    const el = $(id);
+    if (!el.value) return toast('Nothing to copy yet.', 'error');
+    try {
+      await navigator.clipboard.writeText(el.value);
+    } catch (_) {
+      el.removeAttribute('readonly'); el.select(); el.setSelectionRange(0, 99999);
+      try { document.execCommand('copy'); } catch (__) {}
+      el.setAttribute('readonly', ''); 
+    }
+    toast('Copied.');
+  }
+  async function pasteInto(id) {
+    try {
+      $(id).value = (await navigator.clipboard.readText()).trim();
+      if (!$(id).value) toast('Clipboard is empty.', 'error');
+    } catch (_) {
+      toast('Paste blocked. Long-press the box and choose Paste.', 'error');
+      $(id).focus();
+    }
+  }
+  async function shareFrom(id) {
+    const v = $(id).value;
+    if (!v) return toast('Nothing to share yet.', 'error');
+    try { await navigator.share({ text: v }); } catch (_) {}
+  }
+
+  /* ---------- wiring ---------- */
+  function setRole(r) {
+    role = r;
+    $('tab-host').classList.toggle('on', r === 'host');
+    $('tab-join').classList.toggle('on', r === 'join');
+    show('flow-host', r === 'host');
+    show('flow-join', r === 'join');
+  }
+  $('tab-host').onclick = () => setRole('host');
+  $('tab-join').onclick = () => setRole('join');
+  $('btn-mic').onclick = startMic;
+  $('btn-gen-offer').onclick = generateOffer;
+  $('btn-accept').onclick = acceptAnswer;
+  $('btn-gen-answer').onclick = generateAnswer;
+  $('btn-reset').onclick = resetConnection;
+  document.querySelectorAll('[data-copy]').forEach(b => (b.onclick = () => copyFrom(b.dataset.copy)));
+  document.querySelectorAll('[data-paste]').forEach(b => (b.onclick = () => pasteInto(b.dataset.paste)));
+  document.querySelectorAll('[data-share]').forEach(b => {
+    if (!navigator.share) b.classList.add('hidden');
+    else b.onclick = () => shareFrom(b.dataset.share);
+  });
+
+  if (!window.isSecureContext) show('secure-warn');
+})();
+</script>
+</body>
+</html>
